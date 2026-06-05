@@ -261,4 +261,6 @@ The graph must be **recreated on every forward pass** because the nodes hold ref
 
 ---
 
+## License
+
 MIT © [Sachin Kolige](https://github.com/sachinks)
