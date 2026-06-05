@@ -150,48 +150,79 @@ is02p03-autograd-scratch/
 
 ### `xor_solver.py` — the training loop
 
-**Initialisation.** XOR inputs `X` (4×2) and targets `Y` (4×1) are plain tensors with no gradient tracking. Weights `W1` (2×8), `b1` (8,), `W2` (8×1), `b2` (1,) are initialised with `torch.randn` and `requires_grad=True` — they enter the computation graph.
+**Dataset and parameters.** `X` (shape `(4, 2)`) and `Y` (shape `(4, 1)`) are plain float tensors — no `requires_grad`. Weights are initialised with `torch.manual_seed(42)` then `torch.randn` / `torch.zeros`:
 
-**Forward pass.** Each epoch rebuilds the graph from scratch:
-```python
-h     = torch.relu(X @ W1 + b1)      # (4, 8) — hidden layer
-y_hat = torch.sigmoid(h @ W2 + b2)   # (4, 1) — output
-loss  = bce_loss(y_hat, Y)            # scalar
 ```
-Every operation here appends a node to the DAG. The graph lives inside `loss.grad_fn` and its `next_functions` chain.
+W1 = torch.randn(2, HIDDEN, requires_grad=True)   # (2, 8)
+b1 = torch.zeros(HIDDEN,    requires_grad=True)   # (8,)  — zeros init
+W2 = torch.randn(HIDDEN, 1, requires_grad=True)   # (8, 1)
+b2 = torch.zeros(1,         requires_grad=True)   # (1,)  — zeros init
+```
 
-**Backward pass.**
-```python
-loss.backward()
-```
-Traverses the DAG in reverse topological order, multiplying incoming gradients by each node's local gradient. Fills `W1.grad`, `b1.grad`, `W2.grad`, `b2.grad`.
+`params = [W1, b1, W2, b2]`, `lr = 0.1`, `EPOCHS = 2000`.
 
-**Weight update.**
-```python
-with torch.no_grad():
-    for p in params:
-        p -= lr * p.grad
-```
-`torch.no_grad()` switches off graph recording so the subtraction does not create new nodes or leak memory.
+**`relu(x)`** — implemented as `torch.clamp(x, min=0.0)`, not `torch.relu()`. Both are equivalent but `clamp` makes the "floor at zero" literal.
 
-**Gradient reset.**
-```python
-for p in params:
-    p.grad.zero_()
+**`sigmoid(x)`** — implemented as `1.0 / (1.0 + torch.exp(-x))`, not `torch.sigmoid()`. Same reason — makes the formula visible.
+
+**`forward(x)`** — four tensor ops, each adding a node to the graph:
 ```
-Clears gradient buffers before the next epoch. Missing this causes gradients to accumulate across epochs (mistake #2).
+z1 = x @ W1 + b1      # (4,2)@(2,8) + (8,) → (4,8)  bias broadcasts
+a1 = relu(z1)          # (4,8) element-wise
+z2 = a1 @ W2 + b2      # (4,8)@(8,1) + (1,) → (4,1)
+return sigmoid(z2)     # (4,1) probabilities
+```
+
+**`bce_loss(y_hat, y_true)`** — `eps = 1e-7` is added inside both `log()` calls to prevent `log(0) = -inf` → NaN loss when a prediction saturates to 0 or 1.
+
+**`train()`** — four-step loop for `EPOCHS = 2000`:
+1. `y_hat = forward(X)` + `loss = bce_loss(y_hat, Y)` — builds fresh graph
+2. `loss.backward()` — fills `.grad` on all four params
+3. `with torch.no_grad(): p -= lr * p.grad` — update outside graph
+4. `p.grad.zero_()` for each param — clear before next step
+
+Prints `f"epoch {epoch:4d}  loss={loss.item():.4f}"` every 200 epochs.
+
+**`evaluate()`** — runs `forward(X)` inside `torch.no_grad()`, rounds each output to 0/1 with `int(p.item() > 0.5)`, prints OK/WRONG per input.
 
 ### `graph_inspect.py` — DAG printer
 
-Runs one forward pass. Then calls `print_graph(fn, depth=0)` — a recursive function that reads `fn.next_functions`, prints the `type(fn).__name__` and depth at each node, and recurses on each parent. The output traces from `SigmoidBackward` all the way back to the four `AccumulateGrad` leaf nodes, making the invisible graph visible.
+Architecture matches `xor_solver.py`: `HIDDEN = 8`, `torch.manual_seed(42)`. The forward pass uses `torch.relu()` and `torch.sigmoid()` (library calls, not custom functions) — the grad_fn names in the output reflect this.
+
+The file first prints the `.grad_fn` of each intermediate tensor:
+```
+x.grad_fn      : None        ← leaf
+W1.grad_fn     : None        ← leaf parameter (2x8)
+z1.grad_fn     : <AddmmBackward0 ...>
+a1.grad_fn     : <ReluBackward0 ...>
+z2.grad_fn     : <AddmmBackward0 ...>
+output.grad_fn : <SigmoidBackward0 ...>
+```
+
+Then calls `walk(output.grad_fn)` — a recursive function that prints `type(fn).__name__` indented by `"    " * depth`, then iterates `getattr(fn, "next_functions", ())` (safe getattr for leaf nodes that have no `next_functions`) and recurses on each `parent` from the `(parent, output_index)` pairs. The tree terminates at `AccumulateGrad` nodes (the four leaf parameters). A final line prints actual weight shapes for confirmation.
 
 ### `micrograd.py` — from-scratch autograd engine
 
-**`Value` class.** Wraps a Python float (`self.data`) with `self.grad = 0.0`, `self._backward` (a callable, default no-op), and `self._prev` (set of parent `Value`s). Every operator (`__add__`, `__mul__`, `__pow__`, `relu`, `sigmoid`, `log`) computes the forward result and sets `_backward` to the local gradient formula. For example, sigmoid's `_backward` computes `s * (1 - s)` and adds it to each input's `.grad` (addition because gradients accumulate).
+**`Value` class** wraps a single Python float with `data`, `grad = 0.0`, `_backward = lambda: None`, `_prev = set(_children)`, and `_op` (debug label). Every operator builds a new `Value` node and sets its `_backward` closure:
 
-**`backward()` method.** Builds a topological order of all `Value`s reachable from `self` via a DFS through `_prev`. Then iterates in reverse, setting `self.grad = 1.0` and calling `._backward()` on each node. This is exactly what PyTorch's `loss.backward()` does internally, written in ~15 lines of Python.
+| Op | Forward | `_backward` formula |
+|---|---|---|
+| `__add__` | `self.data + other.data` | `self.grad += out.grad; other.grad += out.grad` |
+| `__mul__` | `self.data * other.data` | `self.grad += other.data * out.grad; other.grad += self.data * out.grad` |
+| `__pow__` | `self.data ** p` | `self.grad += p * self.data**(p-1) * out.grad` |
+| `relu` | `max(0, self.data)` | `self.grad += (self.data > 0) * out.grad` |
+| `sigmoid` | `1/(1+exp(-x))` | `self.grad += s*(1-s) * out.grad` |
+| `log` | `math.log(self.data)` | `self.grad += (1/self.data) * out.grad` |
 
-**`Neuron / Layer / MLP`.** Compose `Value`s into a small feedforward network. The training loop is structurally identical to `xor_solver.py`: forward → loss → backward → update → zero grad.
+Helper operators (`__neg__`, `__radd__`, `__sub__`, `__rsub__`, `__rmul__`, `__truediv__`) are all derived from the core six — e.g. `__truediv__` is `self * other**-1`.
+
+**`backward()`** — builds topological order via a DFS `build(v)` helper (post-order: `topo.append(v)` after visiting all parents in `v._prev`). Then sets `self.grad = 1.0` and iterates `reversed(topo)` calling `node._backward()` on each.
+
+**`Neuron(n_in, activation)`** — weights `[Value(random.uniform(-1,1)) for _ in range(n_in)]`, bias `Value(0.0)`. `__call__` computes `sum((wi*xi for wi,xi in zip(w, xs)), self.b)` — the `self.b` as the `start` argument to `sum()` avoids adding a zero-init `Value(0)`. Applies `relu()` or `sigmoid()` based on `activation`.
+
+**`MLP`** — `l1 = Layer(2, 8, "relu")`, `l2 = Layer(8, 1, "sigmoid")`. `__call__` returns `self.l2(self.l1(xs))[0]` — `[0]` extracts the single output `Value` from the length-1 list returned by `Layer`.
+
+**`main()`** — `random.seed(42)`, `lr = 0.5`, 3000 epochs (vs torch: `manual_seed(42)`, `lr = 0.1`, 2000). Slower because arithmetic is scalar-by-scalar. Loop: accumulate BCE loss over 4 examples into `loss = Value(0.0)`, divide by `len(data)`, zero all `.grad` fields manually, `loss.backward()`, SGD `par.data -= lr * par.grad`. Prints every 500 epochs.
 
 ---
 

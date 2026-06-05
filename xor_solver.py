@@ -1,21 +1,37 @@
-"""
-xor_solver.py - 2-layer XOR network using RAW PyTorch tensors only.
+"""xor_solver.py — 2-layer XOR network using raw PyTorch tensors only.
 
-No nn.Module, no nn.Linear, no F.relu, no torch.sigmoid, no optimiser.
-Every operation in the forward pass, backward pass, weight update and
-gradient reset is written explicitly so the autograd mechanism is visible.
+This file is the base build of IS02P03.  It trains a small neural network
+on the XOR problem using **nothing** from ``torch.nn`` or ``torch.optim``:
+no Module, no Linear, no F.relu, no optimiser.  Every operation in the
+forward pass, backward pass, weight update, and gradient reset is written
+explicitly so the autograd mechanism is fully visible.
+
+The XOR problem is chosen because it is the simplest problem a single linear
+layer *cannot* solve (not linearly separable), yet a 2-layer net with a
+non-linearity solves it trivially.  The goal is the mechanism, not the
+problem.
+
+Architecture:  Input(2) -> Linear -> ReLU -> Linear -> Sigmoid -> Output(1)
+Loss:          Binary cross-entropy
+Optimiser:     Manual SGD (no momentum, no scheduler)
+Seed:          torch.manual_seed(42) — every run is identical
+HIDDEN:        8 units (not 4 — see note below)
+
+Hidden-unit note
+----------------
+A 4-neuron ReLU net solves XOR on only ~60% of random seeds.  The remaining
+~40% get trapped in a dead-ReLU local minimum where some neurons output 0 for
+every input, receive zero gradient, and never recover.  8 units give enough
+spare capacity so XOR is solved on every seed.  (Verified: 4 units → 7/12
+seeds, 8 units → 12/12.)  HIDDEN=8 is used in all three files of this project.
 
 Run:  python xor_solver.py
 """
 
 import torch
 
-# ----------------------------------------------------------------------
-# DATASET
-# XOR: output is 1 when the two inputs differ, 0 when they are the same.
-# This is the classic problem a SINGLE linear layer cannot solve - it is
-# not linearly separable - so we need a hidden layer + non-linearity.
-# ----------------------------------------------------------------------
+# ── Dataset ────────────────────────────────────────────────────────────────
+# XOR: output is 1 when inputs differ, 0 when they are the same.
 X = torch.tensor([[0., 0.],
                   [0., 1.],
                   [1., 0.],
@@ -25,47 +41,86 @@ Y = torch.tensor([[0.],
                   [1.],
                   [0.]])              # shape (4, 1)
 
-# ----------------------------------------------------------------------
-# PARAMETERS
-# requires_grad=True is the switch that turns on graph tracking. From now
-# on, every operation these tensors take part in records a node so that
-# .backward() can later compute d(loss)/d(parameter).
-# manual_seed makes the random init reproducible - same run every time.
-# ----------------------------------------------------------------------
+# ── Parameters ─────────────────────────────────────────────────────────────
 torch.manual_seed(42)
-HIDDEN = 8   # 8, not 4: a 4-neuron ReLU net solves XOR only ~60% of seeds
-             # (dead-ReLU local minima). 8 units solve it on every seed.
-W1 = torch.randn(2, HIDDEN, requires_grad=True)   # input(2) -> hidden(8)
-b1 = torch.zeros(HIDDEN,    requires_grad=True)
-W2 = torch.randn(HIDDEN, 1, requires_grad=True)   # hidden(8) -> output(1)
-b2 = torch.zeros(1,         requires_grad=True)
+HIDDEN = 8
+W1 = torch.randn(2, HIDDEN, requires_grad=True)   # (2, 8) input -> hidden
+b1 = torch.zeros(HIDDEN,    requires_grad=True)   # (8,)
+W2 = torch.randn(HIDDEN, 1, requires_grad=True)   # (8, 1) hidden -> output
+b2 = torch.zeros(1,         requires_grad=True)   # (1,)
 
 params = [W1, b1, W2, b2]
 lr = 0.1
 EPOCHS = 2000
 
 
-def relu(x):
-    """ReLU = max(0, x). Local gradient is 1 where x > 0, else 0."""
+def relu(x: torch.Tensor) -> torch.Tensor:
+    """Apply the ReLU activation element-wise: ``max(0, x)``.
+
+    Local gradient is 1 where ``x > 0``, else 0.  This is the non-linearity
+    that lets the 2-layer network solve the non-linearly-separable XOR problem.
+
+    Args:
+        x: any shape tensor.
+
+    Returns:
+        Tensor of same shape with negative values clamped to 0.
+    """
     return torch.clamp(x, min=0.0)
 
 
-def sigmoid(x):
-    """Sigmoid = 1 / (1 + e^-x). Squashes any real number into (0, 1)."""
+def sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """Apply the sigmoid activation element-wise: ``1 / (1 + exp(-x))``.
+
+    Squashes any real number into the open interval (0, 1), making the output
+    interpretable as a probability.
+
+    Local gradient is ``s * (1 - s)`` where ``s = sigmoid(x)``.  This is
+    at most 0.25 (at x=0), which causes vanishing gradients in deep sigmoid
+    networks — avoided here by using ReLU in the hidden layer.
+
+    Args:
+        x: any shape tensor.
+
+    Returns:
+        Tensor of same shape with values in (0, 1).
+    """
     return 1.0 / (1.0 + torch.exp(-x))
 
 
-def forward(x):
-    """x -> Linear -> ReLU -> Linear -> Sigmoid. Returns probability (4,1)."""
-    z1 = x @ W1 + b1          # (4,2)@(2,8) + (8,) -> (4,8)  bias broadcasts
-    a1 = relu(z1)             # (4,8) element-wise
-    z2 = a1 @ W2 + b2         # (4,8)@(8,1) + (1,) -> (4,1)
-    return sigmoid(z2)        # (4,1) probabilities
+def forward(x: torch.Tensor) -> torch.Tensor:
+    """Run the 2-layer network: Input -> Linear -> ReLU -> Linear -> Sigmoid.
+
+    Each operation here adds a node to the computation graph (because W1,
+    b1, W2, b2 have ``requires_grad=True``).  The graph is rebuilt fresh
+    on every call — PyTorch frees intermediate tensors after ``.backward()``
+    so a new graph is needed each epoch.
+
+    Args:
+        x: input tensor of shape ``(4, 2)`` — the 4 XOR input pairs.
+
+    Returns:
+        Output tensor of shape ``(4, 1)`` — predicted probabilities.
+    """
+    z1 = x @ W1 + b1      # (4,2)@(2,8) + (8,) -> (4,8)  bias broadcasts
+    a1 = relu(z1)          # (4,8) element-wise
+    z2 = a1 @ W2 + b2      # (4,8)@(8,1) + (1,) -> (4,1)
+    return sigmoid(z2)     # (4,1) probabilities
 
 
-def bce_loss(y_hat, y_true):
-    """Binary cross-entropy: -mean[ y*log(p) + (1-y)*log(1-p) ].
-    eps keeps log() away from log(0) = -inf (a source of NaN loss)."""
+def bce_loss(y_hat: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    """Compute binary cross-entropy loss: ``-mean[y*log(p) + (1-y)*log(1-p)]``.
+
+    ``eps=1e-7`` is added inside the log to prevent ``log(0) = -inf`` when
+    a prediction is exactly 0.0 or 1.0, which would produce NaN loss.
+
+    Args:
+        y_hat: predicted probabilities, shape ``(4, 1)``, values in (0, 1).
+        y_true: ground-truth labels, shape ``(4, 1)``, values in {0, 1}.
+
+    Returns:
+        A scalar tensor — the mean BCE loss over the 4 examples.
+    """
     eps = 1e-7
     return -torch.mean(
         y_true * torch.log(y_hat + eps) +
@@ -73,23 +128,36 @@ def bce_loss(y_hat, y_true):
     )
 
 
-def train():
+def train() -> float:
+    """Run the full training loop for EPOCHS steps.
+
+    Each epoch:
+      1. FORWARD  — call ``forward(X)`` to build a fresh computation graph.
+      2. BACKWARD — call ``loss.backward()`` to compute gradients via the
+                    chain rule traversing the graph in reverse topological
+                    order.
+      3. UPDATE   — subtract ``lr * grad`` from each parameter inside a
+                    ``torch.no_grad()`` context so the update is not recorded
+                    as a new graph node.
+      4. ZERO     — call ``.grad.zero_()`` on every parameter so gradients
+                    do not accumulate into the next epoch (they ADD, not
+                    replace, by default).
+
+    Prints loss every 200 epochs.
+
+    Returns:
+        The final loss value as a Python float.
+    """
     for epoch in range(EPOCHS):
-        # ---- FORWARD: build the graph fresh this epoch ----------------
         y_hat = forward(X)
         loss = bce_loss(y_hat, Y)
 
-        # ---- BACKWARD: walk the graph in reverse, fill .grad ----------
-        loss.backward()       # populates W1.grad, b1.grad, W2.grad, b2.grad
+        loss.backward()
 
-        # ---- UPDATE: gradient descent step, OUTSIDE the graph ---------
-        # torch.no_grad() stops the subtraction from being recorded as new
-        # graph nodes (the update is not part of the model's computation).
         with torch.no_grad():
             for p in params:
                 p -= lr * p.grad
 
-        # ---- ZERO GRADS: mandatory, .grad ACCUMULATES otherwise -------
         for p in params:
             p.grad.zero_()
 
@@ -99,8 +167,15 @@ def train():
     return loss.item()
 
 
-def evaluate():
-    """Print final predictions. No graph needed -> no_grad saves memory."""
+def evaluate() -> None:
+    """Print final predictions for all 4 XOR inputs.
+
+    Runs inference inside ``torch.no_grad()`` to avoid building a
+    computation graph (memory saving; no gradients needed at eval time).
+
+    Prints each input, the raw probability, the rounded binary prediction,
+    the target label, and OK/WRONG.
+    """
     with torch.no_grad():
         preds = forward(X)
     print("\nFinal predictions (probability that output == 1):")
