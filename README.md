@@ -127,9 +127,15 @@ python graph_inspect.py
 
 # 5. Run the from-scratch autograd engine (pure Python, no dependencies)
 python micrograd.py
+
+# 6. Render the computation graph as a PNG image (stretch goal 1)
+pip install torchviz
+sudo apt install graphviz   # system-level, needed by torchviz
+python visualise_graph.py
+# saves xor_graph.png in the project directory
 ```
 
-`torch.manual_seed(42)` is set at the top of both torch files — every run is identical.
+`torch.manual_seed(42)` is set at the top of all three torch files — every run is identical.
 
 ---
 
@@ -137,10 +143,11 @@ python micrograd.py
 
 ```
 is02p03-autograd-scratch/
-  xor_solver.py      raw-tensor 2-layer XOR solver, manual training loop
-  graph_inspect.py   prints the grad_fn DAG via next_functions recursion
-  micrograd.py       from-scratch autograd engine (~200 lines, pure Python)
-  requirements.txt   torch, numpy
+  xor_solver.py        raw-tensor 2-layer XOR solver, manual training loop
+  graph_inspect.py     prints the grad_fn DAG via next_functions recursion
+  micrograd.py         from-scratch autograd engine (~200 lines, pure Python)
+  visualise_graph.py   renders the computation graph as a PNG via torchviz (stretch goal 1)
+  requirements.txt     torch, numpy
   README.md
 ```
 
@@ -223,6 +230,33 @@ Helper operators (`__neg__`, `__radd__`, `__sub__`, `__rsub__`, `__rmul__`, `__t
 **`MLP`** — `l1 = Layer(2, 8, "relu")`, `l2 = Layer(8, 1, "sigmoid")`. `__call__` returns `self.l2(self.l1(xs))[0]` — `[0]` extracts the single output `Value` from the length-1 list returned by `Layer`.
 
 **`main()`** — `random.seed(42)`, `lr = 0.5`, 3000 epochs (vs torch: `manual_seed(42)`, `lr = 0.1`, 2000). Slower because arithmetic is scalar-by-scalar. Loop: accumulate BCE loss over 4 examples into `loss = Value(0.0)`, divide by `len(data)`, zero all `.grad` fields manually, `loss.backward()`, SGD `par.data -= lr * par.grad`. Prints every 500 epochs.
+
+### `visualise_graph.py` — stretch goal 1: computation graph PNG
+
+Renders the same DAG that `graph_inspect.py` prints as text into a visual PNG image using `torchviz.make_dot` and Graphviz.
+
+**Setup.** Same architecture as `xor_solver.py` — `HIDDEN = 8`, `torch.manual_seed(42)`, same shapes. A single forward pass (no training) builds the computation graph.
+
+**`make_dot(loss, params=params)`** — walks the `grad_fn → next_functions` chain from the loss tensor. The `params` dict maps display names (with shapes) to leaf tensors so they appear labelled in the diagram instead of showing raw memory addresses:
+
+```python
+params = {
+    "W1 (2, 8)": W1,
+    "b1 (8,)":   b1,
+    "W2 (8, 1)": W2,
+    "b2 (1,)":   b2,
+}
+```
+
+**Output (`xor_graph.png`)** — a top-to-bottom DAG (`rankdir="TB"`) showing:
+- **Light-blue nodes** — leaf parameters (`W1`, `b1`, `W2`, `b2`) with their shapes
+- **Grey nodes** — operation nodes labelled with `grad_fn` type (`MmBackward0`, `ClampBackward1`, `ExpBackward0`, etc.)
+- **Green node** — the scalar loss output at the bottom
+- **Arrows** — gradient flow direction, from loss back to weights
+
+The chain reads: `Mm → Add → Clamp(ReLU) → Mm → Add → Neg → Exp → Add → Reciprocal(sigmoid) → Mul/Log(BCE) → Mean → Neg → loss`.
+
+`show_attrs=False, show_saved=False` keep the diagram uncluttered. `cleanup=True` removes the intermediate `.gv` dot source file.
 
 ---
 
